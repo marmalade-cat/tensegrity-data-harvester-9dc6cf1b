@@ -1,0 +1,165 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Tensegrity Data Harvester — Prototype</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;max-width:900px;margin:20px}
+    textarea{width:100%;height:6em}
+    pre{background:#f7f7f7;padding:10px;overflow:auto}
+    button{padding:6px 10px;margin:6px 0}
+    .ok{color:green}.bad{color:#a00}
+  </style>
+</head>
+<body>
+  <h2>Tensegrity Data Harvester — Prototype</h2>
+  <p>I am Marmalade. Paste a paper URL and I will try to find downloadable files linked from it. Browser CORS may block some requests.</p>
+  <label>Paper main URL: <input id="url" style="width:70%"></label>
+  <button id="crawl">Crawl</button>
+  <div id="out"></div>
+
+<script>
+async function fetchText(url){
+  try{
+    const r=await fetch(url);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return await r.text();
+  }catch(e){throw new Error('Fetch failed: '+e.message)}
+}
+function absUrl(base, href){ try{return new URL(href, base).href}catch(e){return null} }
+function guessType(url, text){
+  const lower=url.toLowerCase();
+  if(lower.endsWith('.csv')) return 'csv';
+  if(lower.endsWith('.tsv')||lower.endsWith('.txt')||lower.endsWith('.dat')){
+    // decide by content
+    if(/\t/.test(text)) return 'tsv';
+    if(/^\s*[-+0-9\.]/m.test(text)) return 'numeric';
+    return 'text';
+  }
+  if(lower.endsWith('.json')) return 'json';
+  // fallback: inspect text
+  if(/^\s*\{/.test(text)||/^\s*\[/.test(text)) return 'json';
+  if(/^\s*[-+0-9\.]/m.test(text) || /,/.test(text)) return 'csv';
+  return 'unknown';
+}
+function parseCSV(text, sep=','){
+  const lines=text.split(/\r?\n/).filter(l=>l.trim()!='');
+  const rows=lines.map(l=>l.split(sep).map(s=>s.trim()));
+  return rows;
+}
+function normalizeRecords(rows){
+  // Heuristic: first row header if non-numeric in first cell
+  if(rows.length===0) return [];
+  const hdr=rows[0];
+  const data = rows.slice(1);
+  // if header looks numeric, synthesize names
+  const headerIsNumeric = hdr.every(c=>/^[-+0-9\.eE ]+$/.test(c));
+  const names = headerIsNumeric? hdr.map((_,i)=>'col'+i) : hdr;
+  return data.map(r=>{
+    const obj={};
+    for(let i=0;i<names.length;i++){ obj[names[i]] = r[i]===undefined?'':r[i]; }
+    return obj;
+  });
+}
+
+async function attemptDownload(base, link){
+  const out={url:link, ok:false, reason:'', type:null, records:[], raw:null};
+  try{
+    const text = await fetchText(link);
+    out.raw = text.slice(0,20000); // keep prefix
+    out.type = guessType(link, text);
+    if(out.type==='csv' || out.type==='text'){
+      const rows = parseCSV(text, out.type==='csv'?',':'\t');
+      out.records = normalizeRecords(rows);
+      out.ok = out.records.length>0;
+      if(!out.ok) out.reason='no rows parsed';
+    } else if(out.type==='tsv'){
+      const rows = parseCSV(text,'\t');
+      out.records = normalizeRecords(rows);
+      out.ok = out.records.length>0;
+    } else if(out.type==='json'){
+      try{ const j=JSON.parse(text); if(Array.isArray(j)) out.records=j.map(x=>x); else if(typeof j==='object') out.records=[j]; else out.records=[{value:j}]; out.ok=true }catch(e){ out.reason='json parse error '+e.message }
+    } else if(out.type==='numeric'){
+      // try to parse whitespace separated columns
+      const lines=text.split(/\r?\n/).filter(l=>l.trim());
+      const rows = lines.map(l=>l.trim().split(/\s+/));
+      out.records = normalizeRecords([rows[0].map((_,i)=>'c'+i)].concat(rows));
+      out.ok = out.records.length>0;
+    } else {
+      out.reason='unknown file type';
+    }
+  }catch(e){ out.reason = e.message }
+  return out;
+}
+
+function domLinks(html, base){
+  const doc = new DOMParser().parseFromString(html,'text/html');
+  const a = Array.from(doc.querySelectorAll('a[href]'));
+  return a.map(x=>absUrl(base,x.getAttribute('href'))).filter(Boolean);
+}
+
+function toCSV(records){
+  if(records.length===0) return '';
+  const keys = Array.from(new Set(records.flatMap(r=>Object.keys(r))));
+  const lines = [keys.join(',')];
+  for(const r of records){ lines.push(keys.map(k=> (r[k]===undefined?'':('"'+String(r[k]).replace(/"/g,'""')+'"'))).join(',')); }
+  return lines.join('\n');
+}
+
+document.getElementById('crawl').onclick=async ()=>{
+  const url=document.getElementById('url').value.trim();
+  const out=document.getElementById('out'); out.innerHTML='';
+  if(!url){ out.innerText='Please enter a URL'; return }
+  out.innerText='Fetching paper main URL...';
+  try{
+    const html = await fetchText(url);
+    out.innerText='Extracting links...';
+    const links = domLinks(html,url);
+    if(links.length===0){ out.innerText='No links found on page.'; return }
+    out.innerHTML = '<p>Found '+links.length+' links. Attempting downloads (CORS may block some).</p>';
+    const list = document.createElement('div'); out.appendChild(list);
+    const results = [];
+    for(const l of links.slice(0,40)){
+      const div=document.createElement('div'); div.textContent='Downloading: '+l; list.appendChild(div);
+      try{
+        const res = await attemptDownload(url,l);
+        results.push(res);
+        const s = document.createElement('div');
+        s.innerHTML = (res.ok?'<span class="ok">OK</span> ':'<span class="bad">FAIL</span> ')+
+          '<b>'+l+'</b> type:'+ (res.type||'n/a') + (res.reason?(' — '+res.reason):'');
+        list.appendChild(s);
+      }catch(e){ const s=document.createElement('div'); s.innerHTML='<span class="bad">ERR</span> '+e.message; list.appendChild(s);}    }
+    // Build normalized export: group by inferred module if possible (column names containing module)
+    const good = results.filter(r=>r.ok && r.records.length>0);
+    let allRecords = [];
+    for(const g of good){ allRecords = allRecords.concat(g.records); }
+    const report = document.createElement('div');
+    report.innerHTML = '<h3>Report</h3>';
+    const summary = document.createElement('pre');
+    summary.textContent = 'Downloaded: '+results.length+'; valid time-series files: '+good.length+'; merged records: '+allRecords.length;
+    report.appendChild(summary);
+    // show failed list
+    const failed = results.filter(r=>!r.ok);
+    if(failed.length>0){
+      const f = document.createElement('div'); f.innerHTML='<b>Failures & suggestions</b>';
+      f.appendChild(document.createElement('ul'));
+      for(const ff of failed){ const li=document.createElement('li'); li.textContent = ff.url + ' — ' + (ff.reason||'unknown'); f.querySelector('ul').appendChild(li); }
+      report.appendChild(f);
+    }
+    // exports
+    const jsonExport = {source:url, harvested:good.map(g=>({url:g.url,type:g.type,records:g.records.length})) , mergedRecords:allRecords };
+    const csvText = toCSV(allRecords);
+    const pre = document.createElement('pre'); pre.textContent = 'Normalized JSON (preview):\n'+JSON.stringify(jsonExport,null,2).slice(0,4000);
+    report.appendChild(pre);
+    const btnCsv = document.createElement('button'); btnCsv.textContent='Download CSV';
+    btnCsv.onclick = ()=>{ const b=new Blob([csvText],'text/csv'); const u=URL.createObjectURL(b); const a=document.createElement('a'); a.href=u; a.download='harvest.csv'; a.click(); }
+    const btnJson = document.createElement('button'); btnJson.textContent='Download JSON';
+    btnJson.onclick = ()=>{ const b=new Blob([JSON.stringify(jsonExport,null,2)],{type:'application/json'}); const u=URL.createObjectURL(b); const a=document.createElement('a'); a.href=u; a.download='harvest.json'; a.click(); }
+    report.appendChild(btnCsv); report.appendChild(btnJson);
+    out.appendChild(report);
+
+  }catch(e){ out.innerText='Error: '+e.message }
+}
+</script>
+</body>
+</html>
